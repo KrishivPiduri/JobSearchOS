@@ -7,6 +7,7 @@ Run with:
 
 import json
 import re
+import uuid
 from datetime import date
 from pathlib import Path
 
@@ -27,6 +28,12 @@ except ImportError:
     st.error("Missing dependencies: pip install requests beautifulsoup4")
     st.stop()
 
+try:
+    from linkedin_get_jobs import Query, load_seen_jobs, save_seen_job, get_base_url
+except ImportError as e:
+    st.error(f"Could not import linkedin_get_jobs: {e}. Make sure fake-useragent is installed: pip install fake-useragent")
+    st.stop()
+
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -42,7 +49,6 @@ WAAS_API_URL = "https://www.workatastartup.com/companies/fetch"
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def fetch_text(url: str) -> tuple[str, str | None]:
-    """Fetch URL and return (text, error). text is empty string on failure."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -217,8 +223,9 @@ Return exactly this structure with these exact headers (nothing before the first
 st.set_page_config(page_title="Job Search OS", page_icon="💼", layout="wide")
 st.title("💼 Job Search OS")
 
-tab_gen, tab_lookup, tab_update = st.tabs([
+tab_gen, tab_linkedin, tab_lookup, tab_update = st.tabs([
     "Generate Application",
+    "LinkedIn Jobs",
     "Look Up Job",
     "Update Lookup Table",
 ])
@@ -235,15 +242,24 @@ with tab_gen:
     input_method = st.radio("Input method", ["URL", "Paste text"], horizontal=True, label_visibility="collapsed")
 
     job_text_input = ""
-    job_url_input  = ""
 
     if input_method == "URL":
-        job_url_input = st.text_input("Job listing URL", placeholder="https://www.workatastartup.com/jobs/...")
+        # Pre-fill from LinkedIn tab if a job was sent over
+        prefill = st.session_state.get("send_to_generate", "")
+        job_url_input = st.text_input(
+            "Job listing URL",
+            value=prefill,
+            placeholder="https://www.linkedin.com/jobs/view/... or https://www.workatastartup.com/jobs/...",
+        )
+        if prefill:
+            del st.session_state["send_to_generate"]
     else:
-        job_text_input = st.text_area("Paste job description", height=250, placeholder="Paste the full job description here...")
+        job_url_input = ""
+        job_text_input = st.text_area("Paste job description", height=250,
+                                       placeholder="Paste the full job description here...")
 
     st.subheader("Context URLs")
-    st.caption("Company page, team page, interviewer profile, press coverage — one per line. Optional.")
+    st.caption("Company page, team page, interviewer profile — one per line. Optional.")
     context_urls_raw = st.text_area("Context URLs", height=100, label_visibility="collapsed",
                                      placeholder="https://company.com/about\nhttps://company.com/team")
 
@@ -257,7 +273,6 @@ with tab_gen:
     generate_clicked = st.button("Generate", type="primary", use_container_width=True)
 
     if generate_clicked:
-        # ── Validate ──
         if input_method == "URL" and not job_url_input.strip():
             st.error("Enter a job listing URL.")
             st.stop()
@@ -268,7 +283,6 @@ with tab_gen:
             st.error("Enter both a company name and a role title.")
             st.stop()
 
-        # ── Fetch job text ──
         if input_method == "URL":
             with st.spinner("Fetching job listing..."):
                 job_text, err = fetch_text(job_url_input.strip())
@@ -278,7 +292,6 @@ with tab_gen:
         else:
             job_text = job_text_input.strip()
 
-        # ── Fetch context pages ──
         context_pages = []
         context_urls  = [u.strip() for u in context_urls_raw.splitlines() if u.strip()]
         if context_urls:
@@ -290,9 +303,8 @@ with tab_gen:
                     else:
                         st.warning(f"Could not fetch: {url}")
 
-        # ── Call OpenAI ──
         profile = PROFILE_PATH.read_text(encoding="utf-8")
-        with st.spinner("Generating resume and cover letter… (flex tier — may take a moment)"):
+        with st.spinner("Generating… (flex tier — may take a moment)"):
             try:
                 raw = call_openai(job_text, context_pages, profile)
             except Exception as e:
@@ -301,7 +313,6 @@ with tab_gen:
 
         resume, cover = split_output(raw)
 
-        # ── Save to disk ──
         RESUMES_DIR.mkdir(exist_ok=True)
         OUTREACH_DIR.mkdir(exist_ok=True)
         company_slug = slugify(company_input)
@@ -311,13 +322,11 @@ with tab_gen:
         resume_path.write_text(resume, encoding="utf-8")
         cover_path.write_text(cover,  encoding="utf-8")
 
-        # ── Store in session state ──
         st.session_state["resume"]       = resume
         st.session_state["cover"]        = cover
         st.session_state["resume_fname"] = resume_path.name
         st.session_state["cover_fname"]  = cover_path.name
 
-    # ── Results ──
     if "resume" in st.session_state:
         st.divider()
         res_col, cov_col = st.columns(2)
@@ -345,14 +354,228 @@ with tab_gen:
             )
 
 
-# ── Tab 2: Look Up Job ────────────────────────────────────────────────────────
+# ── Tab 2: LinkedIn Jobs ──────────────────────────────────────────────────────
+
+with tab_linkedin:
+    st.subheader("Search LinkedIn jobs")
+
+    # ── Initialise search config list ──
+    if "li_search_ids" not in st.session_state:
+        st.session_state["li_search_ids"] = [str(uuid.uuid4())]
+
+    # ── Add / remove controls ──
+    add_col, _ = st.columns([1, 5])
+    with add_col:
+        if st.button("＋ Add search", use_container_width=True):
+            st.session_state["li_search_ids"].append(str(uuid.uuid4()))
+            st.rerun()
+
+    # ── One expander per search config ──
+    for uid in list(st.session_state["li_search_ids"]):
+        keyword_preview = st.session_state.get(f"keyword_{uid}", "") or "New search"
+        with st.expander(keyword_preview, expanded=True):
+
+            # Remove button (only show when more than one search exists)
+            if len(st.session_state["li_search_ids"]) > 1:
+                if st.button("✕ Remove this search", key=f"remove_{uid}"):
+                    st.session_state["li_search_ids"].remove(uid)
+                    st.rerun()
+
+            r1c1, r1c2 = st.columns(2)
+            with r1c1:
+                st.text_input(
+                    "Keywords", key=f"keyword_{uid}",
+                    placeholder="Product Manager",
+                    help="Job title, skill, or any text to match against the listing.",
+                )
+            with r1c2:
+                st.text_input(
+                    "Location", key=f"location_{uid}",
+                    placeholder="San Francisco, CA",
+                    help="City, state, or region. LinkedIn matches this against the job's listed location.",
+                )
+
+            r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+            with r2c1:
+                st.selectbox(
+                    "Date posted", ["", "past month", "past week", "24hr"],
+                    key=f"date_{uid}",
+                    help="Limit results to jobs posted within this window.",
+                )
+            with r2c2:
+                st.selectbox(
+                    "Job type", ["", "full time", "part time", "contract", "temporary", "internship"],
+                    key=f"jobtype_{uid}",
+                    help="Filter by employment type.",
+                )
+            with r2c3:
+                st.selectbox(
+                    "Remote", ["", "remote", "hybrid", "on site"],
+                    key=f"remote_{uid}",
+                    help="Filter by where the work is done.",
+                )
+            with r2c4:
+                st.selectbox(
+                    "Experience level", ["", "internship", "entry level", "associate", "senior", "director", "executive"],
+                    key=f"exp_{uid}",
+                    help="Seniority level LinkedIn has tagged the role with.",
+                )
+
+            r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+            with r3c1:
+                st.selectbox(
+                    "Min salary", ["", "40000", "60000", "80000", "100000", "120000"],
+                    key=f"salary_{uid}",
+                    help="Minimum annual salary. Only returns jobs that have a listed salary at or above this threshold.",
+                )
+            with r3c2:
+                st.selectbox(
+                    "Sort by", ["", "recent", "relevant"],
+                    key=f"sort_{uid}",
+                    help="'recent' sorts by date posted. 'relevant' uses LinkedIn's relevance ranking.",
+                )
+            with r3c3:
+                st.number_input(
+                    "Max results", min_value=1, max_value=200, value=25, step=5,
+                    key=f"limit_{uid}",
+                    help="Cap on the number of jobs returned. LinkedIn serves results in batches of 25.",
+                )
+            with r3c4:
+                st.number_input(
+                    "Page", min_value=0, value=0, step=1,
+                    key=f"page_{uid}",
+                    help="Zero-indexed page offset. Page 0 = first 25, page 1 = next 25, etc.",
+                )
+
+            cb1, cb2 = st.columns(2)
+            with cb1:
+                st.checkbox(
+                    "Verified jobs only", key=f"verified_{uid}",
+                    help="Only return roles where LinkedIn has verified the job is still open.",
+                )
+            with cb2:
+                st.checkbox(
+                    "Under 10 applicants only", key=f"under10_{uid}",
+                    help="Surface low-competition postings where fewer than 10 people have applied.",
+                )
+
+    st.divider()
+    only_new      = st.checkbox(
+        "Show only new jobs (hide already seen)", value=True,
+        help="Filters out any job URL already recorded in seen_jobs.txt.",
+    )
+    search_clicked = st.button("Search LinkedIn", type="primary", use_container_width=True)
+
+    if search_clicked:
+        # Collect params from all configs
+        all_params = []
+        for uid in st.session_state["li_search_ids"]:
+            kw  = st.session_state.get(f"keyword_{uid}", "").strip()
+            loc = st.session_state.get(f"location_{uid}", "").strip()
+            if not kw and not loc:
+                continue
+            all_params.append({
+                "keyword":             kw,
+                "location":            loc,
+                "dateSincePosted":     st.session_state.get(f"date_{uid}",     ""),
+                "jobType":             st.session_state.get(f"jobtype_{uid}",  ""),
+                "remoteFilter":        st.session_state.get(f"remote_{uid}",   ""),
+                "salary":              st.session_state.get(f"salary_{uid}",   ""),
+                "experienceLevel":     st.session_state.get(f"exp_{uid}",      ""),
+                "sortBy":              st.session_state.get(f"sort_{uid}",     ""),
+                "limit":               str(int(st.session_state.get(f"limit_{uid}", 25))),
+                "page":                str(int(st.session_state.get(f"page_{uid}",  0))),
+                "has_verification":    st.session_state.get(f"verified_{uid}", False),
+                "under_10_applicants": st.session_state.get(f"under10_{uid}", False),
+            })
+
+        if not all_params:
+            st.error("Enter at least a keyword or location in one of the searches.")
+        else:
+            all_results = []
+            seen        = load_seen_jobs() if only_new else set()
+
+            for i, params in enumerate(all_params):
+                label = params["keyword"] or params["location"]
+                with st.spinner(f"Searching '{label}'…"):
+                    try:
+                        jobs = Query(params).get_jobs()
+                    except Exception as e:
+                        st.warning(f"Search '{label}' failed: {e}")
+                        continue
+
+                if only_new:
+                    jobs = [j for j in jobs if get_base_url(j.get("jobUrl", "")) not in seen]
+
+                all_results.extend(jobs)
+
+            # Deduplicate across searches by URL
+            seen_in_results = set()
+            deduped = []
+            for j in all_results:
+                url = get_base_url(j.get("jobUrl", ""))
+                if url not in seen_in_results:
+                    seen_in_results.add(url)
+                    deduped.append(j)
+
+            if not deduped:
+                st.info("No results found.")
+            else:
+                st.session_state["li_results"] = deduped
+                st.success(f"Found {len(deduped)} {'new ' if only_new else ''}jobs across {len(all_params)} search(es).")
+
+    # ── Results ──
+    if "li_results" in st.session_state and st.session_state["li_results"]:
+        results = st.session_state["li_results"]
+        st.divider()
+
+        labels       = [f"{j['position']}  —  {j['company']}  ({j.get('location', '')})" for j in results]
+        selected_idx = st.selectbox("Select a job", range(len(results)), format_func=lambda i: labels[i])
+        selected_job = results[selected_idx]
+
+        info_cols = st.columns(4)
+        info_cols[0].metric("Company",  selected_job.get("company", "—"))
+        info_cols[1].metric("Location", selected_job.get("location") or "—")
+        info_cols[2].metric("Salary",   selected_job.get("salary") or "—")
+        info_cols[3].metric("Posted",   selected_job.get("agoTime") or selected_job.get("date") or "—")
+
+        btn_col1, btn_col2, btn_col3 = st.columns(3)
+        with btn_col1:
+            if st.button("➡ Send to Generate tab", use_container_width=True):
+                st.session_state["send_to_generate"] = get_base_url(selected_job.get("jobUrl", ""))
+                st.success("URL loaded — switch to the Generate Application tab.")
+        with btn_col2:
+            if st.button("👁 Mark selected as seen", use_container_width=True):
+                url = get_base_url(selected_job.get("jobUrl", ""))
+                if url:
+                    save_seen_job(url)
+                    st.success("Marked as seen.")
+        with btn_col3:
+            if st.button("👁 Mark all as seen", use_container_width=True):
+                for job in results:
+                    url = get_base_url(job.get("jobUrl", ""))
+                    if url:
+                        save_seen_job(url)
+                st.success(f"Marked {len(results)} jobs as seen.")
+
+        st.divider()
+        st.caption(f"{len(results)} results")
+        for job in results:
+            url = get_base_url(job.get("jobUrl", ""))
+            col_a, col_b, col_c, col_d = st.columns([3, 2, 2, 1])
+            col_a.markdown(f"**{job.get('position', '—')}**  \n{job.get('company', '')}")
+            col_b.write(job.get("location") or "—")
+            col_c.write(job.get("salary") or "—")
+            col_d.markdown(f"[View]({url})" if url else "—")
+
+
+# ── Tab 3: Look Up Job ────────────────────────────────────────────────────────
 
 with tab_lookup:
     st.subheader("Look up a workatastartup.com job")
     st.caption("Requires job_lookup.json — run **Update Lookup Table** first if you haven't.")
 
-    lookup_url = st.text_input("Job URL", placeholder="https://www.workatastartup.com/jobs/89758",
-                               key="lookup_url")
+    lookup_url     = st.text_input("Job URL", placeholder="https://www.workatastartup.com/jobs/89758")
     lookup_clicked = st.button("Look up", type="primary")
 
     if lookup_clicked:
@@ -384,7 +607,7 @@ with tab_lookup:
                     st.text(job.get("description", "(no description available)"))
 
 
-# ── Tab 3: Update Lookup Table ────────────────────────────────────────────────
+# ── Tab 4: Update Lookup Table ────────────────────────────────────────────────
 
 with tab_update:
     st.subheader("Update job lookup table")
@@ -426,12 +649,11 @@ with tab_update:
             except requests.RequestException as e:
                 code = e.response.status_code if hasattr(e, "response") and e.response else "?"
                 if code in (401, 403, 422):
-                    st.error(f"Auth error ({code}) — your session cookie has expired. Update WAAS_COOKIE in secret.py.")
+                    st.error(f"Auth error ({code}) — session cookie expired. Update WAAS_COOKIE in secret.py.")
                 else:
                     st.error(f"Request failed: {e}")
                 st.stop()
 
-        # Build entries
         existing = json.loads(LOOKUP_PATH.read_text(encoding="utf-8")) if LOOKUP_PATH.exists() else {}
         fresh    = {}
         for company in data.get("companies", []):
@@ -452,5 +674,4 @@ with tab_update:
         merged    = {**existing, **fresh}
 
         LOOKUP_PATH.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        st.success(f"Done — {n_new} new jobs added, {n_updated} updated, {len(merged)} total in lookup.")
+        st.success(f"Done — {n_new} new, {n_updated} updated, {len(merged)} total in lookup.")
